@@ -380,6 +380,12 @@ local function onFileRegister(pos, length)
         + wxstc.wxSTC_FOLDLEVELHEADERFLAG)
       findReplace:SetStatus(TR("Found match in '%s'."):format(GetFileName(findReplace.curfilename)))
 
+      -- store file modification time for later validation during save
+      if not reseditor.fileMeta then reseditor.fileMeta = {} end
+      reseditor.fileMeta[findReplace.curfilename] = {
+        modTime = GetFileModTime(findReplace.curfilename)
+      }
+
       lines = lines + 1
 
       -- show context lines before posline
@@ -1289,63 +1295,135 @@ local package = ide:AddPackage('core.findreplace', {
         local oveditor = ide:CreateStyledTextCtrl(findReplace.panel, wx.wxID_ANY,
           wx.wxDefaultPosition, wx.wxSize(0,0), wx.wxBORDER_NONE)
         local files, lines = 0, 0
-        local report
+        local skipped, failed = 0, 0
+        local report = {}
+
+        -- helper to skip remaining lines of current file in preview
+        local function skipFileLines(curline)
+          while true do
+            curline = curline + 1
+            local nexttext = getRawLine(editor, curline)
+            if not nexttext or nexttext == "" then break end
+            -- a non-indented, non-placeholder line that's not a number line
+            -- marks the start of a new file or end of section
+            if not nexttext:find("^%s") and not nexttext:find("^%s*%.+$") then break end
+          end
+          return curline - 1
+        end
+
         while true do
           -- for each marker that marks a file (MarkerNext)
           line = editor:MarkerNext(line + 1, FILE_MARKER_VALUE)
           if line == wx.wxNOT_FOUND then break end
 
           local fname = getRawLine(editor, line) -- get the file name
-          local filetext, err = FileRead(fname)
-          local mismatch = false
-          if filetext then
-            findReplace:SetStatus(GetFileName(fname))
-            wx.wxSafeYield()
 
-            oveditor:SetTextDyn(filetext)
-            while true do -- for each line following the file name
-              line = line + 1
-              local text = getRawLine(editor, line)
-              local lnum, lmark, ltext = text:match("^%s*(%d+)([ :]) (.*)")
-              if lnum then
-                lnum = tonumber(lnum)
-                if lmark == ':' then -- if the change line, then apply the change
-                  local pos = oveditor:PositionFromLine(lnum-1)
-                  if pos == wx.wxNOT_FOUND then
-                    mismatch = lnum
+          -- check if file still exists
+          if not wx.wxFileExists(fname) then
+            failed = failed + 1
+            report[#report+1] = {file = fname, status = "failed", reason = "file not found"}
+            line = skipFileLines(line)
+          else
+            -- check if file was modified since preview was generated
+            local fileMeta = editor.fileMeta and editor.fileMeta[fname]
+            local currentModTime = GetFileModTime(fname)
+            if fileMeta and fileMeta.modTime and currentModTime
+            and not currentModTime:IsEqualTo(fileMeta.modTime) then
+              skipped = skipped + 1
+              report[#report+1] = {file = fname, status = "skipped",
+                reason = "file was modified after preview was generated"}
+              line = skipFileLines(line)
+            else
+              local filetext, err = FileRead(fname)
+              if not filetext then
+                failed = failed + 1
+                report[#report+1] = {file = fname, status = "failed", reason = err or "cannot read file"}
+              else
+                findReplace:SetStatus(GetFileName(fname))
+                wx.wxSafeYield()
+
+                oveditor:SetTextDyn(filetext)
+                local mismatch = false
+                local fileLines = 0
+                while true do -- for each line following the file name
+                  line = line + 1
+                  local text = getRawLine(editor, line)
+                  local lnum, lmark, ltext = text:match("^%s*(%d+)([ :]) (.*)")
+                  if lnum then
+                    lnum = tonumber(lnum)
+                    if lmark == ':' then -- if the change line, then apply the change
+                      local pos = oveditor:PositionFromLine(lnum-1)
+                      if pos == wx.wxNOT_FOUND then
+                        mismatch = lnum
+                        break
+                      end
+                      oveditor:SetTargetStart(pos)
+                      oveditor:SetTargetEnd(pos+#getRawLine(oveditor, lnum-1))
+                      oveditor:ReplaceTarget(ltext)
+                      fileLines = fileLines + 1
+                    -- if the context line, then check the context
+                    elseif lnum-1 >= oveditor:GetLineCount() then
+                      mismatch = lnum
+                      break
+                    elseif getRawLine(oveditor, lnum-1) ~= ltext then
+                      mismatch = lnum
+                      break
+                    end
+                  -- if not placeholder line " ...", then abort
+                  elseif not text:find("^%s*%.+$") then
                     break
                   end
-                  oveditor:SetTargetStart(pos)
-                  oveditor:SetTargetEnd(pos+#getRawLine(oveditor, lnum-1))
-                  oveditor:ReplaceTarget(ltext)
-                  lines = lines + 1
-                -- if the context line, then check the context
-                elseif getRawLine(oveditor, lnum-1) ~= ltext then
-                  mismatch = lnum
-                  break
                 end
-              -- if not placeholder line " ...", then abort
-              elseif not text:find("^%s*%.+$") then
-                break
+                if fileLines > 0 and not mismatch then -- save the file
+                  local ok
+                  ok, err = FileWrite(fname, oveditor:GetTextDyn())
+                  if ok then
+                    files = files + 1
+                    lines = lines + fileLines
+                    report[#report+1] = {file = fname, status = "updated", count = fileLines}
+                  else
+                    failed = failed + 1
+                    report[#report+1] = {file = fname, status = "failed", reason = err or "write failed"}
+                  end
+                elseif mismatch then
+                  skipped = skipped + 1
+                  report[#report+1] = {file = fname, status = "skipped",
+                    reason = "context mismatch on line " .. mismatch}
+                end
               end
             end
-            if lines > 0 and not mismatch then -- save the file
-              local ok
-              ok, err = FileWrite(fname, oveditor:GetTextDyn())
-              if ok then files = files + 1 end
-            end
-          end
-          if err or mismatch then
-            report = (report or "") .. (("\n%s: %s")
-              :format(fname, mismatch and "mismatch on line "..mismatch or err))
           end
         end
         oveditor:Destroy() -- destroy the editor to release its memory
-        if report then editor:AppendTextDyn("\n"..report) end
-        editor:AppendTextDyn(("\n\nUpdated %d %s in %d %s.")
-          :format(
-            lines, makePlural("line", lines),
-            files, makePlural("file", files)))
+
+        -- build detailed report
+        if #report > 0 then
+          local reportText = ""
+          for _, entry in ipairs(report) do
+            if entry.status == "updated" then
+              reportText = reportText .. ("\n%s: updated %d %s")
+                :format(entry.file, entry.count, makePlural("line", entry.count))
+            elseif entry.status == "skipped" then
+              reportText = reportText .. ("\n%s: skipped (%s)"):format(entry.file, entry.reason)
+            elseif entry.status == "failed" then
+              reportText = reportText .. ("\n%s: failed (%s)"):format(entry.file, entry.reason)
+            end
+          end
+          editor:AppendTextDyn(reportText)
+        end
+
+        -- build summary
+        local summary = ("\n\nUpdated %d %s in %d %s.")
+          :format(lines, makePlural("line", lines), files, makePlural("file", files))
+        if skipped > 0 then
+          summary = summary .. (" Skipped %d %s.")
+            :format(skipped, makePlural("file", skipped))
+        end
+        if failed > 0 then
+          summary = summary .. (" Failed %d %s.")
+            :format(failed, makePlural("file", failed))
+        end
+        editor:AppendTextDyn(summary)
         editor:EnsureVisibleEnforcePolicy(editor:GetLineCount()-1)
         editor:SetSavePoint() -- set unmodified status when done
         findReplace:SetStatus(TR("Updated %d file.", files):format(files))

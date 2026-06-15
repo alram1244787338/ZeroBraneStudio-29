@@ -97,6 +97,107 @@ editor:MarkerAdd(0, FILE_MARKER)
 ide:GetDocument(editor):Save()
 is(editor:GetText():match("Updated %d"), "Updated 0", "Replace fails on invalid line numbers.")
 
+-- test: successful batch replace across multiple files
+local tmpfile1 = "t/tmp_test1.lua"
+local tmpfile2 = "t/tmp_test2.lua"
+FileWrite(tmpfile1, "hello world\nfoo bar\nbaz qux\n")
+FileWrite(tmpfile2, "hello there\nfoo baz\n")
+
+editor:SetText("")
+editor:AppendText(tmpfile1.."\n")
+editor:AppendText("    1: hello replaced\n")
+editor:AppendText("    2  foo bar\n")
+editor:AppendText(tmpfile2.."\n")
+editor:AppendText("    1: hello replaced\n")
+editor.searchpreview = true
+editor.replace = true
+editor:MarkerAdd(0, FILE_MARKER)
+editor:MarkerAdd(3, FILE_MARKER)
+ide:GetDocument(editor):Save()
+
+local result1 = FileRead(tmpfile1)
+local result2 = FileRead(tmpfile2)
+is(result1, "hello replaced\nfoo bar\nbaz qux\n", "Batch replace updates first file correctly.")
+is(result2, "hello replaced\nfoo baz\n", "Batch replace updates second file correctly.")
+ok(editor:GetText():match("Updated 2 lines in 2 files"), "Batch replace reports correct summary.")
+
+-- test: single file mismatch doesn't affect other files
+FileWrite(tmpfile1, "hello world\nfoo bar\nbaz qux\n")
+FileWrite(tmpfile2, "hello there\nfoo baz\n")
+
+editor:SetText("")
+editor:AppendText(tmpfile1.."\n")
+editor:AppendText("    1: hello replaced\n")
+editor:AppendText("    2  WRONG CONTEXT\n") -- mismatch on line 2
+editor:AppendText(tmpfile2.."\n")
+editor:AppendText("    1: hello replaced\n")
+editor.searchpreview = true
+editor.replace = true
+editor:MarkerAdd(0, FILE_MARKER)
+editor:MarkerAdd(3, FILE_MARKER)
+ide:GetDocument(editor):Save()
+
+result1 = FileRead(tmpfile1)
+result2 = FileRead(tmpfile2)
+is(result1, "hello world\nfoo bar\nbaz qux\n", "File with mismatch is not modified.")
+is(result2, "hello replaced\nfoo baz\n", "Other file is still updated despite mismatch in first file.")
+ok(editor:GetText():match("Updated 1 line in 1 file"), "Summary shows only successful updates.")
+ok(editor:GetText():match("Skipped 1 file"), "Summary shows skipped file.")
+ok(editor:GetText():match(tmpfile1..": skipped %(context mismatch"), "Report shows mismatch details for first file.")
+
+-- test: deleted file is reported as failed
+FileWrite(tmpfile1, "hello world\nfoo bar\n")
+FileRemove(tmpfile2)
+
+editor:SetText("")
+editor:AppendText(tmpfile1.."\n")
+editor:AppendText("    1: hello replaced\n")
+editor:AppendText(tmpfile2.."\n")
+editor:AppendText("    1: hello replaced\n")
+editor.searchpreview = true
+editor.replace = true
+editor:MarkerAdd(0, FILE_MARKER)
+editor:MarkerAdd(2, FILE_MARKER)
+ide:GetDocument(editor):Save()
+
+result1 = FileRead(tmpfile1)
+is(result1, "hello replaced\nfoo bar\n", "Existing file is updated when another file is deleted.")
+ok(editor:GetText():match("Updated 1 line in 1 file"), "Summary shows successful update.")
+ok(editor:GetText():match("Failed 1 file"), "Summary shows failed file.")
+ok(editor:GetText():match(tmpfile2..": failed %(file not found%)"), "Report shows deleted file details.")
+
+-- test: modified file (mod time change) is skipped
+FileWrite(tmpfile1, "hello world\nfoo bar\n")
+FileWrite(tmpfile2, "hello there\nfoo baz\n")
+
+editor:SetText("")
+editor:AppendText(tmpfile1.."\n")
+editor:AppendText("    1: hello replaced\n")
+editor.fileMeta = {[tmpfile1] = {modTime = GetFileModTime(tmpfile1)}}
+editor:AppendText(tmpfile2.."\n")
+editor:AppendText("    1: hello replaced\n")
+editor.searchpreview = true
+editor.replace = true
+editor:MarkerAdd(0, FILE_MARKER)
+editor:MarkerAdd(2, FILE_MARKER)
+
+-- modify file1 after capturing mod time
+os.execute("sleep 1") -- ensure time difference
+FileWrite(tmpfile1, "hello world\nfoo bar\nmodified line\n")
+
+ide:GetDocument(editor):Save()
+
+result1 = FileRead(tmpfile1)
+result2 = FileRead(tmpfile2)
+is(result1, "hello world\nfoo bar\nmodified line\n", "Modified file is not overwritten.")
+is(result2, "hello replaced\nfoo baz\n", "Unmodified file is still updated.")
+ok(editor:GetText():match("Updated 1 line in 1 file"), "Summary shows only unmodified file.")
+ok(editor:GetText():match("Skipped 1 file"), "Summary shows skipped modified file.")
+ok(editor:GetText():match(tmpfile1..": skipped %(file was modified"), "Report shows modification details.")
+
+-- cleanup
+FileRemove(tmpfile1)
+FileRemove(tmpfile2)
 
 findReplace:SetFind("something")
 findReplace:Show() -- set focus on the find
