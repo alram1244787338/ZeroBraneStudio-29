@@ -1288,8 +1288,11 @@ local package = ide:AddPackage('core.findreplace', {
         local line = wx.wxNOT_FOUND
         local oveditor = ide:CreateStyledTextCtrl(findReplace.panel, wx.wxID_ANY,
           wx.wxDefaultPosition, wx.wxSize(0,0), wx.wxBORDER_NONE)
-        local files, lines = 0, 0
+        local files, lines, skipped = 0, 0, 0
         local report
+        local function addReport(fname, msg)
+          report = (report or "") .. (("\n%s: %s"):format(fname, msg))
+        end
         while true do
           -- for each marker that marks a file (MarkerNext)
           line = editor:MarkerNext(line + 1, FILE_MARKER_VALUE)
@@ -1297,28 +1300,38 @@ local package = ide:AddPackage('core.findreplace', {
 
           local fname = getRawLine(editor, line) -- get the file name
           local filetext, err = FileRead(fname)
-          local mismatch = false
+          -- the file may have been turned into a binary/non-text file after
+          -- the preview was generated; skip it rather than corrupt its content
+          if filetext and IsBinary(filetext) then
+            filetext, err = nil, "skipped (binary or non-text content)"
+          end
+          local mismatch = false -- line number whose context no longer matches
+          local badline = false -- line number that points outside the file
+          local filelines = 0 -- number of changes applied to this file's copy
           if filetext then
             findReplace:SetStatus(GetFileName(fname))
             wx.wxSafeYield()
 
             oveditor:SetTextDyn(filetext)
+            local linecount = oveditor:GetLineCount()
             while true do -- for each line following the file name
               line = line + 1
               local text = getRawLine(editor, line)
               local lnum, lmark, ltext = text:match("^%s*(%d+)([ :]) (.*)")
               if lnum then
                 lnum = tonumber(lnum)
+                -- the referenced line must still exist in the file
+                local pos = (lnum >= 1 and lnum <= linecount)
+                  and oveditor:PositionFromLine(lnum-1) or wx.wxNOT_FOUND
+                if pos == wx.wxNOT_FOUND then
+                  badline = lnum
+                  break
+                end
                 if lmark == ':' then -- if the change line, then apply the change
-                  local pos = oveditor:PositionFromLine(lnum-1)
-                  if pos == wx.wxNOT_FOUND then
-                    mismatch = lnum
-                    break
-                  end
                   oveditor:SetTargetStart(pos)
                   oveditor:SetTargetEnd(pos+#getRawLine(oveditor, lnum-1))
                   oveditor:ReplaceTarget(ltext)
-                  lines = lines + 1
+                  filelines = filelines + 1
                 -- if the context line, then check the context
                 elseif getRawLine(oveditor, lnum-1) ~= ltext then
                   mismatch = lnum
@@ -1329,15 +1342,30 @@ local package = ide:AddPackage('core.findreplace', {
                 break
               end
             end
-            if lines > 0 and not mismatch then -- save the file
+            -- only save when changes were applied and no problem was found;
+            -- a mismatch or bad line means the file no longer matches the
+            -- preview, so its (partial) changes are discarded and the file
+            -- is left untouched instead of being half-updated
+            if filelines > 0 and not mismatch and not badline then
               local ok
               ok, err = FileWrite(fname, oveditor:GetTextDyn())
-              if ok then files = files + 1 end
+              if ok then
+                files = files + 1
+                lines = lines + filelines
+                addReport(fname, ("updated %d %s"):format(filelines, makePlural("line", filelines)))
+              end
             end
           end
-          if err or mismatch then
-            report = (report or "") .. (("\n%s: %s")
-              :format(fname, mismatch and "mismatch on line "..mismatch or err))
+          -- report the outcome per file so it's clear what was and wasn't saved
+          if mismatch then
+            skipped = skipped + 1
+            addReport(fname, ("skipped (content changed at line %d)"):format(mismatch))
+          elseif badline then
+            skipped = skipped + 1
+            addReport(fname, ("skipped (invalid line number %d)"):format(badline))
+          elseif err then
+            skipped = skipped + 1
+            addReport(fname, err)
           end
         end
         oveditor:Destroy() -- destroy the editor to release its memory
@@ -1346,6 +1374,9 @@ local package = ide:AddPackage('core.findreplace', {
           :format(
             lines, makePlural("line", lines),
             files, makePlural("file", files)))
+        if skipped > 0 then
+          editor:AppendTextDyn((" Skipped %d %s."):format(skipped, makePlural("file", skipped)))
+        end
         editor:EnsureVisibleEnforcePolicy(editor:GetLineCount()-1)
         editor:SetSavePoint() -- set unmodified status when done
         findReplace:SetStatus(TR("Updated %d file.", files):format(files))
