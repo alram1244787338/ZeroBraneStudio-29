@@ -75,6 +75,9 @@ local function treeAddDir(tree,parent_id,rootdir)
       if dirmapped[file] then
         name = file:gsub(q(projpath), ""):gsub(pathsep.."$","")
         icon = image.DIRECTORYMAPPED
+        -- watch mapped directories so external changes are detected
+        -- even when they're not expanded in the tree
+        watchDir(file)
       end
 
       local item = items[name .. icon]
@@ -373,6 +376,9 @@ local function treeSetConnectorsAndIcons(tree)
 
     tree:Freeze()
 
+    -- prune stale watchers for the old path and its children before refresh
+    if isdir and not isnew then watcherPruneStale(source) end
+
     refreshAncestors(tree:GetItemParent(itemsrc))
 
     -- if not new, check if source is already opened in the editor
@@ -403,6 +409,22 @@ local function treeSetConnectorsAndIcons(tree)
 
     -- close the target document, since the source has already been updated for it
     if targetdoc and #sourcedocs > 0 then targetdoc:Close() end
+
+    -- update start file path if the renamed item is a directory containing it
+    if isdir and not isnew then
+      local project = ide:GetProject()
+      local startfile = project and filetree.settings.startfile[project]
+      if startfile then
+        local startfull = MergeFullPath(project, startfile)
+        if startfull:find(q(source..pathsep), 1, true) == 1
+        or (iscaseinsensitive and startfull:lower():find(q((source..pathsep):lower()), 1, true) == 1) then
+          local newstart = (not iscaseinsensitive and startfull:gsub(q(source), escapedtarget)
+            or startfull:lower():gsub(q(source:lower()), escapedtarget))
+          filetree.settings.startfile[project] = newstart:gsub(q(project), "")
+          saveSettings()
+        end
+      end
+    end
 
     tree:Thaw()
 
@@ -453,6 +475,8 @@ local function treeSetConnectorsAndIcons(tree)
           :format(source, wx.wxSysErrorMsg()))
       end
     end
+    -- prune stale watchers for deleted directory
+    if isdir then watcherPruneStale(source) end
     refreshAncestors(tree:GetItemParent(item_id))
     PackageEventHandle("onFiletreeFileDelete", tree, item_id, source)
     return true
@@ -1096,6 +1120,17 @@ local function unWatchDir(path)
   if watcher and watchers[path] then watcher:Remove(wx.wxFileName.DirName(path)) end
   watchers[path] = nil
 end
+-- remove watchers for paths that are under a deleted/renamed directory
+local function watcherPruneStale(dirpath)
+  if not dirpath then return end
+  local prefix = dirpath:match("(.*[/\\])") or dirpath
+  local prefixpat = "^"..q(prefix)
+  for wpath in pairs(watchers) do
+    if wpath == dirpath or wpath:find(prefixpat) then
+      unWatchDir(wpath)
+    end
+  end
+end
 
 local function syncTree(editor)
     local doc = editor and ide:GetDocument(editor)
@@ -1119,15 +1154,43 @@ local package = ide:AddPackage('core.filetree', {
 
         local needrefresh = {}
         ide:GetMainFrame():Connect(wx.wxEVT_FSWATCHER, function(event)
-            -- using `GetNewPath` to make it work with rename operations
-            needrefresh[event:GetNewPath():GetFullPath()] = event:GetChangeType()
+            local newpath = event:GetNewPath():GetFullPath()
+            local oldpath = event:GetPath():GetFullPath()
+            local change = event:GetChangeType()
+
+            -- for rename/delete, queue parent refresh using the old path
+            -- so that stale nodes are removed from the tree
+            if change == wx.wxFSW_EVENT_RENAME or change == wx.wxFSW_EVENT_DELETE then
+              needrefresh[MergeFullPath(oldpath, "../\1")] = change
+            end
+            -- for rename/create, also refresh at the new path to pick up new items
+            if change == wx.wxFSW_EVENT_RENAME or change == wx.wxFSW_EVENT_CREATE then
+              needrefresh[newpath] = change
+            end
+            -- prune stale watchers for deleted/renamed directories
+            if change == wx.wxFSW_EVENT_DELETE or change == wx.wxFSW_EVENT_RENAME then
+              watcherPruneStale(oldpath)
+            end
+
             ide:DoWhenIdle(function()
-                for file, kind in pairs(needrefresh) do
-                  -- if the file is removed, try to find a non-existing file in the same folder
-                  -- as this will trigger a refresh of that folder
-                  local path = MergeFullPath(file, kind == wx.wxFSW_EVENT_DELETE and "../\1"  or "")
-                  local tree = ide:GetProjectTree() -- project tree may be hidden/disabled
-                  if ide:IsValidCtrl(tree) then tree:FindItem(path) end
+                local tree = ide:GetProjectTree() -- project tree may be hidden/disabled
+                if ide:IsValidCtrl(tree) then
+                  for path, kind in pairs(needrefresh) do
+                    -- safety check: if path doesn't exist, force parent refresh
+                    local target = path
+                    if not path:find("\1") then
+                      if not wx.wxFileExists(path) and not wx.wxDirExists(path) then
+                        target = MergeFullPath(path, "../\1")
+                      end
+                    end
+                    tree:FindItem(target)
+                  end
+                  -- sync current file marker after watcher-triggered refresh
+                  local editor = ide:GetEditor()
+                  if editor then
+                    local doc = ide:GetDocument(editor)
+                    if doc then FileTreeMarkSelected(doc:GetFilePath()) end
+                  end
                 end
                 needrefresh = {}
               end)
@@ -1146,9 +1209,14 @@ local package = ide:AddPackage('core.filetree', {
 
     -- check on Collapse when collapsing to make sure it's unwatched only when collapsed
     onFiletreeCollapse = function(plugin, tree, event, item_id)
+      -- never unwatch the root or project directory to keep external change detection active
+      if tree:IsRoot(item_id) then return end
+      local project = ide:GetProject()
+      local dir = tree:GetItemFullName(item_id)
+      if project and ide:IsSameDirectoryPath(dir, project) then return end
       -- only unwatch if the directory is not empty;
       -- otherwise it's collapsed without ability to expand
-      if tree:GetChildrenCount(item_id, false) > 0 then unWatchDir(tree:GetItemFullName(item_id)) end
+      if tree:GetChildrenCount(item_id, false) > 0 then unWatchDir(dir) end
     end,
 
     onEditorFocusSet = function(plugin, editor)
@@ -1160,6 +1228,23 @@ local package = ide:AddPackage('core.filetree', {
     onEditorClose = function(plugin, editor)
       -- check if the last document is being closed
       if #ide:GetDocumentList() <= 1 then syncTree() end
+    end,
+
+    -- safety net: when watcher is unavailable, refresh expanded dirs on app activation
+    -- to catch external changes that the watcher would normally detect
+    onAppFocusSet = function(plugin, app)
+      if watcher then return end -- watcher is active, no need for manual refresh
+      ide:DoWhenIdle(function()
+          local tree = ide:GetProjectTree()
+          if ide:IsValidCtrl(tree) then
+            tree:RefreshChildren()
+            local editor = ide:GetEditor()
+            if editor then
+              local doc = ide:GetDocument(editor)
+              if doc then FileTreeMarkSelected(doc:GetFilePath()) end
+            end
+          end
+        end, "core.filetree.onappfocusset")
     end,
   })
 MergeSettings(filetree.settings, package:GetSettings())

@@ -177,3 +177,157 @@ ok(ide.config.foo == nil, "RemoveConfig unsets specified config file.")
 
 -- check that ide.config.styles still has metatable
 ok(getmetatable(ide.config.styles) == cmt, "Removing config file restores original styles.")
+
+-- ============================================================
+-- Regression tests for project tree refresh
+-- ============================================================
+-- Project is already set to "t" from earlier tests
+local sep = GetPathSeparator()
+
+-- helper: refresh the tree root (same as manual refresh)
+local function refreshTree()
+  tree:RefreshChildren()
+end
+
+-- helper: check if a name exists as a child of the given tree item
+local function treeHasChild(parent, name)
+  local item, cookie = tree:GetFirstChild(parent)
+  while item:IsOk() do
+    if tree:GetItemText(item) == name then return true end
+    item, cookie = tree:GetNextChild(parent, cookie)
+  end
+  return false
+end
+
+local root = tree:GetRootItem()
+
+-- 1. File creation is reflected after refresh
+local testfilepath = "t" .. sep .. "_refresh_test.lua"
+FileWrite(testfilepath, "-- test")
+refreshTree()
+ok(tree:FindItem(testfilepath) ~= nil, "Tree shows newly created file after refresh.")
+ok(treeHasChild(root, "_refresh_test.lua"), "New file appears as child of root after refresh.")
+
+-- 2. File deletion is reflected after refresh
+wx.wxRemoveFile(MergeFullPath(wx.wxGetCwd(), testfilepath))
+refreshTree()
+ok(tree:FindItem(testfilepath) == nil, "Tree removes deleted file after refresh.")
+
+-- 3. File rename is reflected after refresh (old gone, new present)
+local srcfile = "t" .. sep .. "_rsrc.lua"
+local dstfile = "t" .. sep .. "_rdst.lua"
+FileWrite(srcfile, "-- rename me")
+refreshTree()
+ok(tree:FindItem(srcfile) ~= nil, "Source file is in tree before rename.")
+wx.wxRenameFile(MergeFullPath(wx.wxGetCwd(), srcfile), MergeFullPath(wx.wxGetCwd(), dstfile))
+refreshTree()
+ok(tree:FindItem(srcfile) == nil, "Source file removed from tree after rename.")
+ok(tree:FindItem(dstfile) ~= nil, "Destination file appears in tree after rename.")
+wx.wxRemoveFile(MergeFullPath(wx.wxGetCwd(), dstfile))
+
+-- 4. Directory rename is reflected after refresh
+local srcdir = "t" .. sep .. "_dirsrc"
+local dstdir = "t" .. sep .. "_dirdst"
+wx.wxMkdir(MergeFullPath(wx.wxGetCwd(), srcdir))
+refreshTree()
+local srcitem = tree:FindItem(srcdir)
+ok(srcitem ~= nil, "Source directory appears in tree before rename.")
+wx.wxRenameFile(MergeFullPath(wx.wxGetCwd(), srcdir), MergeFullPath(wx.wxGetCwd(), dstdir))
+refreshTree()
+ok(tree:FindItem(srcdir) == nil, "Source directory removed from tree after rename.")
+ok(tree:FindItem(dstdir) ~= nil, "Destination directory appears in tree after rename.")
+wx.wxRmdir(MergeFullPath(wx.wxGetCwd(), dstdir))
+
+-- 5. Directory deletion is reflected after refresh
+local testdir = "t" .. sep .. "_rmdir"
+wx.wxMkdir(MergeFullPath(wx.wxGetCwd(), testdir))
+refreshTree()
+ok(tree:FindItem(testdir) ~= nil, "Directory appears in tree after creation.")
+wx.wxRmdir(MergeFullPath(wx.wxGetCwd(), testdir))
+refreshTree()
+ok(tree:FindItem(testdir) == nil, "Directory removed from tree after deletion.")
+
+-- 6. Files inside a renamed directory are accessible under new path
+local dirbefore = "t" .. sep .. "_parentold"
+local dirafter  = "t" .. sep .. "_parentnew"
+wx.wxMkdir(MergeFullPath(wx.wxGetCwd(), dirbefore))
+FileWrite(dirbefore .. sep .. "child.lua", "-- child")
+refreshTree()
+local parentitem = tree:FindItem(dirbefore)
+ok(parentitem ~= nil, "Parent directory found before rename.")
+tree:Expand(parentitem)
+refreshTree() -- also refreshes the expanded child
+ok(tree:FindItem(dirbefore .. sep .. "child.lua") ~= nil,
+  "Child file visible inside parent before rename.")
+wx.wxRenameFile(MergeFullPath(wx.wxGetCwd(), dirbefore), MergeFullPath(wx.wxGetCwd(), dirafter))
+refreshTree()
+ok(tree:FindItem(dirbefore) == nil, "Old parent directory gone after rename.")
+local newchild = tree:FindItem(dirafter .. sep .. "child.lua")
+ok(newchild ~= nil, "Child file accessible under renamed parent path.")
+wx.wxRemoveFile(MergeFullPath(wx.wxGetCwd(), dirafter .. sep .. "child.lua"))
+wx.wxRmdir(MergeFullPath(wx.wxGetCwd(), dirafter))
+
+-- 7. Mapped directory: external file changes reflected after refresh
+local mapdir = MergeFullPath(wx.wxStandardPaths.Get():GetTempDir(), "_zbtest_mapdir")
+wx.wxMkdir(mapdir)
+FileWrite(mapdir .. sep .. "mapped.lua", "-- mapped")
+tree:MapDirectory(mapdir)
+refreshTree()
+ok(treeHasChild(root, mapdir:gsub(sep .. "$", "")), "Mapped directory appears in tree root.")
+-- add a file to the mapped directory externally
+FileWrite(mapdir .. sep .. "extra.lua", "-- extra")
+refreshTree()
+ok(tree:FindItem(mapdir .. sep .. "extra.lua") ~= nil,
+  "File added to mapped directory externally appears after refresh.")
+-- remove a file from the mapped directory externally
+wx.wxRemoveFile(mapdir .. sep .. "extra.lua")
+refreshTree()
+ok(tree:FindItem(mapdir .. sep .. "extra.lua") == nil,
+  "File removed from mapped directory externally disappears after refresh.")
+tree:UnmapDirectory(mapdir)
+wx.wxRemoveFile(mapdir .. sep .. "mapped.lua")
+wx.wxRmdir(mapdir)
+
+-- 8. Hidden extension rule is preserved after refresh
+ide.filetree.settings.extensionignore["tmp"] = true
+FileWrite("t" .. sep .. "_hidden.tmp", "temp")
+FileWrite("t" .. sep .. "_visible.lua", "-- visible")
+refreshTree()
+ok(tree:FindItem("t" .. sep .. "_hidden.tmp") == nil,
+  "Files with hidden extension are not shown after refresh.")
+ok(tree:FindItem("t" .. sep .. "_visible.lua") ~= nil,
+  "Files with non-hidden extension are shown after refresh.")
+ide.filetree.settings.extensionignore["tmp"] = nil
+refreshTree()
+ok(tree:FindItem("t" .. sep .. "_hidden.tmp") ~= nil,
+  "Previously hidden files appear after un-hiding extension and refreshing.")
+wx.wxRemoveFile(MergeFullPath(wx.wxGetCwd(), "t" .. sep .. "_hidden.tmp"))
+wx.wxRemoveFile(MergeFullPath(wx.wxGetCwd(), "t" .. sep .. "_visible.lua"))
+
+-- 9. Start file icon is updated after rename
+FileWrite("t" .. sep .. "_startfile.lua", "-- start")
+refreshTree()
+tree:SetStartFile("t" .. sep .. "_startfile.lua")
+local sfitem = tree:FindItem("t" .. sep .. "_startfile.lua")
+ok(sfitem ~= nil and tree:IsFileStart(sfitem),
+  "Start file has correct start-file icon after setting.")
+tree:SetStartFile() -- unset
+wx.wxRemoveFile(MergeFullPath(wx.wxGetCwd(), "t" .. sep .. "_startfile.lua"))
+
+-- 10. Collapse and re-expand refreshes directory content
+local cedir = "t" .. sep .. "_collapse_test"
+wx.wxMkdir(MergeFullPath(wx.wxGetCwd(), cedir))
+refreshTree()
+local ceitem = tree:FindItem(cedir)
+ok(ceitem ~= nil, "Test directory for collapse test is in tree.")
+tree:Expand(ceitem)
+refreshTree()
+-- add a file while the directory is collapsed
+tree:Collapse(ceitem)
+FileWrite(cedir .. sep .. "late.lua", "-- late")
+-- re-expand: should pick up the new file via treeAddDir in EXPANDING handler
+tree:Expand(ceitem)
+ok(tree:FindItem(cedir .. sep .. "late.lua") ~= nil,
+  "File added while directory was collapsed appears after re-expand.")
+wx.wxRemoveFile(MergeFullPath(wx.wxGetCwd(), cedir .. sep .. "late.lua"))
+wx.wxRmdir(MergeFullPath(wx.wxGetCwd(), cedir))
