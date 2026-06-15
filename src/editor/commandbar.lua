@@ -349,6 +349,55 @@ local weights = {onegram = 0.1, digram = 0.4, trigram = 0.5}
 local cache = {}
 local missing = 3 -- penalty for missing symbols (1 missing == N matching)
 local casemismatch = 0.9 -- score for case mismatch (%% of full match)
+-- Intuition-driven bonuses layered on top of the ngram score to make the most
+-- relevant candidate (exact file name, name prefix, a contiguous keyword in the
+-- path, an acronym for short queries) rank above coincidental ngram overlaps.
+-- Only whitespace is stripped from the pattern (the user's spaces are "soft");
+-- separators inside the candidate are preserved, so a pattern that differs from
+-- a name only by using a space where the name has `-`/`_`/`/` is NOT treated as
+-- an exact match -- this keeps the "close, but not 100%" behavior.
+local function matchBonus(p, v)
+  local pc = p:gsub("%s+", ""):lower() -- soft pattern: whitespace removed, lowercased
+  if #pc == 0 then return 0 end
+  local pcs = p:gsub("%s+", "")        -- soft pattern, original case
+  local vl = v:lower()
+  local base = v:match("[^/\\]*$") or v -- basename: part after the last path separator
+  local bl = base:lower()
+  local cov = #pc / math.max(#bl, 1)   -- fraction of the basename the pattern covers
+  local bonus = 0
+
+  -- exact basename, or basename prefix (case-insensitive; small extra for exact case)
+  if bl == pc then
+    bonus = bonus + 90 + (base == pcs and 30 or 0)
+  elseif #pc < #bl and bl:sub(1, #pc) == pc then
+    bonus = bonus + (40 + 30 * cov) + (base:sub(1, #pcs) == pcs and 20 or 0)
+  end
+
+  -- whole (soft) pattern present as a contiguous run in the candidate;
+  -- worth more inside the basename and at a word boundary
+  local at = vl:find(pc, 1, true) -- plain search: pattern chars are literal here
+  if at then
+    local boundary = at == 1 or vl:sub(at-1, at-1):find("[/\\%-_ .]") ~= nil
+    local inbase = at > (#vl - #bl)
+    local b3 = (inbase and 30 or 14) * (0.5 + 0.5 * math.min(cov, 1))
+    if boundary then b3 = b3 + (inbase and 12 or 6) end
+    bonus = bonus + b3
+  end
+
+  -- short patterns: reward chars landing on word starts (CamelCase / post-separator)
+  if #pc <= 4 then
+    local i = 1
+    for pos = 1, #bl do
+      local isstart = pos == 1
+        or base:sub(pos, pos):find("%u") ~= nil
+        or bl:sub(pos-1, pos-1):find("[/\\%-_ .]") ~= nil
+      if isstart and i <= #pc and bl:sub(pos, pos) == pc:sub(i, i) then i = i + 1 end
+    end
+    if i > #pc then bonus = bonus + 8 * #pc end
+  end
+
+  return bonus
+end
 local function score(p, v)
   local function ngrams(str, num, low, needcache)
     local key = str..(low and '\1' or '\2')..num
@@ -378,14 +427,17 @@ local function score(p, v)
   local key = p..'\3'..v
   if not cache[key] then
     -- ignore all whitespaces in the pattern for one-gram comparison
-    local score = weights.onegram * overlap(p:gsub("%s+",""), v, 1)
-    if score > 0 then -- don't bother with those that can't even score 1grams
-      p = ' '..(p:gsub(sep, ' '))
-      v = ' '..(v:gsub(sep, ' '))
-      score = score + weights.digram * overlap(p, v, 2)
-      score = score + weights.trigram * overlap(' '..p, ' '..v, 3)
+    local sc = weights.onegram * overlap(p:gsub("%s+",""), v, 1)
+    local bonus = 0
+    if sc > 0 then -- don't bother with those that can't even score 1grams
+      -- work on copies so the original `p`/`v` stay available for `matchBonus`
+      local pp = ' '..(p:gsub(sep, ' '))
+      local vv = ' '..(v:gsub(sep, ' '))
+      sc = sc + weights.digram * overlap(pp, vv, 2)
+      sc = sc + weights.trigram * overlap(' '..pp, ' '..vv, 3)
+      bonus = matchBonus(p, v)
     end
-    cache[key] = 2 * 100 * score
+    cache[key] = 2 * 100 * sc + bonus
   end
   return cache[key]
 end
@@ -396,15 +448,19 @@ local function commandBarScoreItems(t, pattern, limit)
   local num = 0
   local total = #t
   local prefilter = ide.config.commandbar and tonumber(ide.config.commandbar.prefilter)
-  -- anchor for 1-2 symbol patterns to speed up search
-  local needanchor = prefilter and prefilter * 4 <= #t and plen <= 2
-  local pref = pattern:sub(1,4):lower()
-  local filter = prefilter and prefilter <= #t
-    -- expand `abc` into `a.*b.*c`, but limit the prefix to avoid penalty for `s.*s.*s.*....`
-    -- if there are too many records to filter, then only search for substrings
-    and (prefilter * 10 <= #t and q(pref):gsub("%s+",".")
-      or pref:gsub("%s",""):gsub(".", function(s) return q(s)..".*" end):gsub("%.%*$",""))
-    or nil
+  -- Safe prefilter for large projects: keep any candidate that contains the
+  -- typed characters (whitespace ignored) as an in-order subsequence. Unlike a
+  -- substring or anchored filter, this never drops a candidate that the scorer
+  -- would rank highly. Capping the expanded prefix only makes the filter MORE
+  -- permissive (a prefix subsequence is a superset of the full one), so the
+  -- prefilter and the final score can't disagree about what should match.
+  local filter
+  if prefilter and prefilter <= #t then
+    local chars = pattern:gsub("%s+",""):sub(1, 12)
+    if #chars > 0 then
+      filter = chars:gsub(".", function(s) return q(s)..".*" end):gsub("%.%*$","")
+    end
+  end
   local lastpercent = 0
   for n, v in ipairs(t) do
     -- there was additional input while scoring, so abort to check for it
@@ -417,17 +473,12 @@ local function commandBarScoreItems(t, pattern, limit)
       if showProgress then showProgress(progress) end
     end
 
-    if #v >= plen then
-      local match = filter and v:lower():find(filter)
-      -- check if the current name needs to be prefiltered or anchored (for better performance);
-      -- if it needs to be anchored, then anchor it at the beginning of the string or the word
-      if not filter or (match and (not needanchor or match == 1 or v:find("^[%p%s]", match-1))) then
-        local p = math.floor(score(pattern, v))
-        maxp = math.max(p, maxp)
-        if p > 1 and p > maxp / 4 then
-          num = num + 1
-          r[num] = {v, p}
-        end
+    if #v >= plen and (not filter or v:lower():find(filter)) then
+      local p = math.floor(score(pattern, v))
+      maxp = math.max(p, maxp)
+      if p > 1 and p > maxp / 4 then
+        num = num + 1
+        r[num] = {v, p}
       end
     end
   end
