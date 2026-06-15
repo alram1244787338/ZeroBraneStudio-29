@@ -1096,6 +1096,19 @@ local function unWatchDir(path)
   if watcher and watchers[path] then watcher:Remove(wx.wxFileName.DirName(path)) end
   watchers[path] = nil
 end
+-- reconcile the set of active watches with what's actually on disk;
+-- a directory that was renamed away or deleted keeps a stale watch that
+-- silently stops delivering events, so drop it here. This also clears it
+-- from the blacklist, so a directory created later at the same path can be
+-- watched again instead of being permanently ignored.
+local function refreshWatches()
+  for path in pairs(watchers) do
+    if not wx.wxDirExists(path) then unWatchDir(path) end
+  end
+  for path in pairs(blacklist) do
+    if not wx.wxDirExists(path) then blacklist[path] = nil end
+  end
+end
 
 local function syncTree(editor)
     local doc = editor and ide:GetDocument(editor)
@@ -1119,15 +1132,35 @@ local package = ide:AddPackage('core.filetree', {
 
         local needrefresh = {}
         ide:GetMainFrame():Connect(wx.wxEVT_FSWATCHER, function(event)
-            -- using `GetNewPath` to make it work with rename operations
-            needrefresh[event:GetNewPath():GetFullPath()] = event:GetChangeType()
+            -- record both the old and the new path of the event; they only
+            -- differ for rename/move operations, but in that case both folders
+            -- need to be reconciled: the stale node has to be removed from the
+            -- source folder and the new node added to the target folder.
+            for _, fn in ipairs({event:GetPath(), event:GetNewPath()}) do
+              local fullpath = fn:GetFullPath()
+              if #fullpath > 0 then needrefresh[fullpath] = true end
+            end
             ide:DoWhenIdle(function()
-                for file, kind in pairs(needrefresh) do
-                  -- if the file is removed, try to find a non-existing file in the same folder
-                  -- as this will trigger a refresh of that folder
-                  local path = MergeFullPath(file, kind == wx.wxFSW_EVENT_DELETE and "../\1"  or "")
-                  local tree = ide:GetProjectTree() -- project tree may be hidden/disabled
-                  if ide:IsValidCtrl(tree) then tree:FindItem(path) end
+                local tree = ide:GetProjectTree() -- project tree may be hidden/disabled
+                if ide:IsValidCtrl(tree) then
+                  for file in pairs(needrefresh) do
+                    -- decide what to refresh based on what's on disk *now*
+                    -- (more reliable than the event type, as a quick add/remove
+                    -- sequence may collapse into one): if the path still exists,
+                    -- refresh the folder that contains it so the node is (re)added;
+                    -- otherwise point at a non-existing entry in the same folder
+                    -- to force that folder to refresh and drop the stale node.
+                    local exists = wx.wxFileExists(file) or wx.wxDirExists(file)
+                    tree:FindItem(exists and file or MergeFullPath(file, "../\1"))
+                  end
+                  -- a watched directory may have been renamed away or removed
+                  -- by this batch of events, so reconcile the watches as well.
+                  refreshWatches()
+                  -- the current file's node may have been recreated by the
+                  -- folder reconcile above, which drops its selection mark, so
+                  -- re-mark it to keep the open file highlighted.
+                  local editor = ide:GetEditor()
+                  if editor then FileTreeMarkSelected(ide:GetDocument(editor):GetFilePath()) end
                 end
                 needrefresh = {}
               end)
@@ -1160,6 +1193,26 @@ local package = ide:AddPackage('core.filetree', {
     onEditorClose = function(plugin, editor)
       -- check if the last document is being closed
       if #ide:GetDocumentList() <= 1 then syncTree() end
+    end,
+
+    -- the file system watcher can be disabled, may be unavailable on the
+    -- platform, or simply miss events (more likely with many or mapped
+    -- directories, or on network drives); regaining focus is a reliable
+    -- moment to reconcile the tree with disk so it doesn't get stuck showing
+    -- stale nodes when the watcher didn't deliver. This complements (and is a
+    -- fallback for) the watcher, so it follows the same `showchanges` setting.
+    onAppFocusSet = function(plugin)
+      if not ide.config.filetree.showchanges then return end
+      local tree = ide:GetProjectTree()
+      if not ide:IsValidCtrl(tree) then return end
+      ide:DoWhenIdle(function()
+          if not ide:IsValidCtrl(tree) then return end
+          refreshWatches() -- drop watches for directories that disappeared
+          tree:RefreshChildren() -- reconcile expanded folders with disk
+          -- re-mark the current file, as its node may have been recreated
+          local editor = ide:GetEditor()
+          if editor then FileTreeMarkSelected(ide:GetDocument(editor):GetFilePath()) end
+        end, "core.filetree.onappfocusset")
     end,
   })
 MergeSettings(filetree.settings, package:GetSettings())
